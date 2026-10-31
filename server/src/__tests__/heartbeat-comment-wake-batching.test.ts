@@ -29,6 +29,14 @@ async function closeDbClient(db: ReturnType<typeof createDb> | undefined) {
   await db?.$client?.end?.({ timeout: 0 });
 }
 
+// The gateway `agent` params schema has no field for Paperclip metadata, so the
+// adapter carries the structured wake payload as JSON in the message text.
+function wakeFromAgentPayload(payload: Record<string, unknown>): { wake: unknown } {
+  const match = String(payload.message ?? "").match(/Structured wake payload JSON:\n```json\n([\s\S]*?)\n```/);
+  if (!match) throw new Error("agent message has no structured wake payload JSON");
+  return { wake: JSON.parse(match[1]!) };
+}
+
 async function createControlledGatewayServer() {
   const server = createServer();
   const wss = new WebSocketServer({ server });
@@ -44,7 +52,7 @@ async function createControlledGatewayServer() {
       JSON.stringify({
         type: "event",
         event: "connect.challenge",
-        payload: { nonce: "nonce-123" },
+        payload: { nonce: "nonce-123", ts: Date.now() },
       }),
     );
 
@@ -67,7 +75,7 @@ async function createControlledGatewayServer() {
             ok: true,
             payload: {
               type: "hello-ok",
-              protocol: 3,
+              protocol: 4,
               server: { version: "test", connId: "conn-1" },
               features: { methods: ["connect", "agent", "agent.wait"], events: ["agent"] },
               snapshot: { version: 1, ts: Date.now() },
@@ -97,14 +105,24 @@ async function createControlledGatewayServer() {
             },
           }),
         );
-        return;
-      }
-
-      if (frame.method === "agent.wait") {
+        // Protocol v4: the terminal outcome is a second `res` for the same
+        // request. The first run stays active until the test releases it.
         waitCount += 1;
         if (waitCount === 1) {
           await firstWaitGate;
         }
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { runId, status: "ok", summary: "completed", result: { payloads: [], meta: {} } },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "agent.wait") {
         socket.send(
           JSON.stringify({
             type: "res",
@@ -448,7 +466,7 @@ describe("heartbeat comment wake batching", () => {
       }, 90_000);
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
+      expect(wakeFromAgentPayload(secondPayload)).toMatchObject({
         wake: {
           commentIds: [comment2.id, comment3.id],
           latestCommentId: comment3.id,
@@ -587,7 +605,9 @@ describe("heartbeat comment wake batching", () => {
 
       await waitFor(() => gateway.getAgentPayloads().length === 2);
       const promotedPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(promotedPayload.paperclip).toMatchObject({
+      // The agent sees the normalized wake payload rendered into its message;
+      // comment presentation/metadata and the comment window are not part of it.
+      expect(wakeFromAgentPayload(promotedPayload)).toMatchObject({
         wake: {
           commentIds: [queuedComment.id],
           latestCommentId: queuedComment.id,
@@ -596,20 +616,8 @@ describe("heartbeat comment wake batching", () => {
               id: queuedComment.id,
               authorType: "user",
               body: "Queued follow-up",
-              presentation: expect.objectContaining({
-                kind: "system_notice",
-                tone: "warning",
-              }),
-              metadata: expect.objectContaining({
-                version: 1,
-              }),
             }),
           ],
-          commentWindow: {
-            requestedCount: 1,
-            includedCount: 1,
-            missingCount: 0,
-          },
         },
       });
       expect(String(promotedPayload.message ?? "")).toContain("Queued follow-up");
@@ -790,7 +798,7 @@ describe("heartbeat comment wake batching", () => {
       });
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
+      expect(wakeFromAgentPayload(secondPayload)).toMatchObject({
         wake: {
           reason: "issue_commented",
           commentIds: [comment2.id],
@@ -990,7 +998,7 @@ describe("heartbeat comment wake batching", () => {
       expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
+      expect(wakeFromAgentPayload(secondPayload)).toMatchObject({
         wake: {
           reason: "issue_comment_mentioned",
           commentIds: [comment.id],
@@ -1076,7 +1084,7 @@ describe("heartbeat comment wake batching", () => {
       expect(firstRun).not.toBeNull();
       await waitFor(() => gateway.getAgentPayloads().length === 1);
       const firstPayload = gateway.getAgentPayloads()[0] ?? {};
-      expect(firstPayload.paperclip).toMatchObject({
+      expect(wakeFromAgentPayload(firstPayload)).toMatchObject({
         wake: {
           reason: "issue_assigned",
           issue: {
