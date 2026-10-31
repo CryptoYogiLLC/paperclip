@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { resolveSessionKey } from "./execute.js";
+import {
+  createAssistantTextAccumulator,
+  projectAssistantEventForLog,
+  resolveSessionKey,
+} from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -48,5 +52,57 @@ describe("resolveSessionKey", () => {
         issueId: null,
       }),
     ).toBe("agent:meridian:paperclip");
+  });
+});
+
+describe("createAssistantTextAccumulator", () => {
+  it("appends deltas and treats text as the authoritative item snapshot", () => {
+    const acc = createAssistantTextAccumulator();
+    acc.apply({ itemId: "a", delta: "Hel", text: "Hel" });
+    acc.apply({ itemId: "a", delta: "lo", text: "Hello" });
+    expect(acc.text()).toBe("Hello");
+  });
+
+  it("appends bare deltas and honors replace without a snapshot", () => {
+    const acc = createAssistantTextAccumulator();
+    acc.apply({ itemId: "a", delta: "draft" });
+    acc.apply({ itemId: "a", delta: " one" });
+    expect(acc.text()).toBe("draft one");
+    acc.apply({ itemId: "a", delta: "final", replace: true });
+    expect(acc.text()).toBe("final");
+  });
+
+  it("applies an empty replacement snapshot", () => {
+    const acc = createAssistantTextAccumulator();
+    acc.apply({ itemId: "a", delta: "secret", text: "secret" });
+    acc.apply({ itemId: "a", delta: "", text: "", replace: true });
+    expect(acc.text()).toBe("");
+  });
+
+  it("keeps assistant items separate in arrival order", () => {
+    const acc = createAssistantTextAccumulator();
+    acc.apply({ itemId: "run:0", delta: "Checking", text: "Checking" });
+    acc.apply({ itemId: "run:1", delta: "Done", text: "Done" });
+    acc.apply({ itemId: "run:0", delta: " the issue", text: "Checking the issue" });
+    expect(acc.text()).toBe("Checking the issue\n\nDone");
+  });
+});
+
+describe("projectAssistantEventForLog", () => {
+  it("drops the repeated snapshot from delta events", () => {
+    expect(projectAssistantEventForLog({ itemId: "a", delta: "lo", text: "Hello" })).toEqual({
+      itemId: "a",
+      delta: "lo",
+    });
+  });
+
+  it("keeps the snapshot when the event carries no delta or replaces the item", () => {
+    expect(projectAssistantEventForLog({ itemId: "a", text: "Hello" })).toEqual({ itemId: "a", text: "Hello" });
+    expect(projectAssistantEventForLog({ itemId: "a", delta: "", text: "Hi", replace: true })).toEqual({
+      itemId: "a",
+      delta: "",
+      text: "Hi",
+      replace: true,
+    });
   });
 });
