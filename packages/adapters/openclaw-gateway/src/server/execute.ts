@@ -6,6 +6,7 @@ import type {
 import { asNumber, asString, buildPaperclipEnv, parseObject } from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
+import { GATEWAY_PROTOCOL_VERSION, parseConnectChallenge } from "./protocol.js";
 
 type SessionKeyStrategy = "fixed" | "issue" | "run";
 
@@ -58,12 +59,19 @@ type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
   expectFinal: boolean;
+  onAccepted?: (payload: Record<string, unknown> | null) => void;
   timer: ReturnType<typeof setTimeout> | null;
 };
 
 type GatewayResponseError = Error & {
   gatewayCode?: string;
   gatewayDetails?: Record<string, unknown>;
+  gatewayPayload?: Record<string, unknown>;
+};
+
+type GatewayConnectChallenge = {
+  nonce: string;
+  ts: number;
 };
 
 type GatewayClientOptions = {
@@ -75,10 +83,16 @@ type GatewayClientOptions = {
 
 type GatewayClientRequestOptions = {
   timeoutMs: number;
+  /**
+   * Two-phase request (the v4 `agent` method): the gateway first answers with
+   * `status: "accepted"` and later sends a second `res` with the same id that
+   * carries the terminal outcome. The accepted ack goes to `onAccepted`; the
+   * promise settles on the terminal frame.
+   */
   expectFinal?: boolean;
+  onAccepted?: (payload: Record<string, unknown> | null) => void;
 };
 
-const PROTOCOL_VERSION = 3;
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
@@ -415,56 +429,15 @@ function appendWakeText(baseText: string, wakeText: string): string {
   return trimmedBase.length > 0 ? `${trimmedBase}\n\n${wakeText}` : wakeText;
 }
 
-function buildStandardPaperclipPayload(
-  ctx: AdapterExecutionContext,
-  wakePayload: WakePayload,
-  paperclipEnv: Record<string, string>,
-  payloadTemplate: Record<string, unknown>,
-): Record<string, unknown> {
-  const templatePaperclip = parseObject(payloadTemplate.paperclip);
-  const workspace = asRecord(ctx.context.paperclipWorkspace);
-  const workspaces = Array.isArray(ctx.context.paperclipWorkspaces)
-    ? ctx.context.paperclipWorkspaces.filter((entry): entry is Record<string, unknown> => Boolean(asRecord(entry)))
-    : [];
-  const configuredWorkspaceRuntime = parseObject(ctx.config.workspaceRuntime);
-  const runtimeServiceIntents = Array.isArray(ctx.context.paperclipRuntimeServiceIntents)
-    ? ctx.context.paperclipRuntimeServiceIntents.filter(
-        (entry): entry is Record<string, unknown> => Boolean(asRecord(entry)),
-      )
-    : [];
-
-  const standardPaperclip: Record<string, unknown> = {
-    runId: ctx.runId,
-    companyId: ctx.agent.companyId,
-    agentId: ctx.agent.id,
-    agentName: ctx.agent.name,
-    taskId: wakePayload.taskId,
-    issueId: wakePayload.issueId,
-    issueIds: wakePayload.issueIds,
-    wakeReason: wakePayload.wakeReason,
-    wakeCommentId: wakePayload.wakeCommentId,
-    approvalId: wakePayload.approvalId,
-    approvalStatus: wakePayload.approvalStatus,
-    apiUrl: paperclipEnv.PAPERCLIP_API_URL ?? null,
-  };
-
-  if (workspace) {
-    standardPaperclip.workspace = workspace;
-  }
-  if (workspaces.length > 0) {
-    standardPaperclip.workspaces = workspaces;
-  }
-  if (runtimeServiceIntents.length > 0 || Object.keys(configuredWorkspaceRuntime).length > 0) {
-    standardPaperclip.workspaceRuntime = {
-      ...configuredWorkspaceRuntime,
-      ...(runtimeServiceIntents.length > 0 ? { services: runtimeServiceIntents } : {}),
-    };
-  }
-
-  return {
-    ...templatePaperclip,
-    ...standardPaperclip,
-  };
+function joinWakePayloadSections(structuredWakePrompt: string, structuredWakeJson: string): string {
+  const sections = [
+    structuredWakePrompt.trim(),
+    "Structured wake payload JSON:",
+    "```json",
+    structuredWakeJson,
+    "```",
+  ].filter((entry) => entry.trim().length > 0);
+  return sections.join("\n");
 }
 
 function normalizeUrl(input: string): URL | null {
@@ -596,12 +569,12 @@ function isEventFrame(value: unknown): value is GatewayEventFrame {
 class GatewayWsClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
-  private challengePromise: Promise<string>;
-  private resolveChallenge!: (nonce: string) => void;
+  private challengePromise: Promise<GatewayConnectChallenge>;
+  private resolveChallenge!: (challenge: GatewayConnectChallenge) => void;
   private rejectChallenge!: (err: Error) => void;
 
   constructor(private readonly opts: GatewayClientOptions) {
-    this.challengePromise = new Promise<string>((resolve, reject) => {
+    this.challengePromise = new Promise<GatewayConnectChallenge>((resolve, reject) => {
       this.resolveChallenge = resolve;
       this.rejectChallenge = reject;
     });
@@ -609,7 +582,7 @@ class GatewayWsClient {
   }
 
   async connect(
-    buildConnectParams: (nonce: string) => Record<string, unknown>,
+    buildConnectParams: (challenge: GatewayConnectChallenge) => Record<string, unknown>,
     timeoutMs: number,
   ): Promise<Record<string, unknown> | null> {
     this.ws = new WebSocket(this.opts.url, {
@@ -662,8 +635,8 @@ class GatewayWsClient {
       "gateway websocket open timeout",
     );
 
-    const nonce = await withTimeout(this.challengePromise, timeoutMs, "gateway connect challenge timeout");
-    const signedConnectParams = buildConnectParams(nonce);
+    const challenge = await withTimeout(this.challengePromise, timeoutMs, "gateway connect challenge timeout");
+    const signedConnectParams = buildConnectParams(challenge);
 
     const hello = await this.request<Record<string, unknown> | null>("connect", signedConnectParams, {
       timeoutMs,
@@ -703,6 +676,7 @@ class GatewayWsClient {
         resolve: (value) => resolve(value as T),
         reject,
         expectFinal: opts.expectFinal === true,
+        onAccepted: opts.onAccepted,
         timer,
       });
     });
@@ -735,12 +709,13 @@ class GatewayWsClient {
 
     if (isEventFrame(parsed)) {
       if (parsed.event === "connect.challenge") {
-        const payload = asRecord(parsed.payload);
-        const nonce = nonEmpty(payload?.nonce);
-        if (nonce) {
-          this.resolveChallenge(nonce);
-          return;
+        const challenge = parseConnectChallenge(parsed.payload);
+        if ("error" in challenge) {
+          this.rejectChallenge(new Error(challenge.error));
+        } else {
+          this.resolveChallenge(challenge);
         }
+        return;
       }
       void Promise.resolve(this.opts.onEvent(parsed)).catch(() => {
         // Ignore event callback failures and keep stream active.
@@ -755,7 +730,12 @@ class GatewayWsClient {
 
     const payload = asRecord(parsed.payload);
     const status = nonEmpty(payload?.status)?.toLowerCase();
-    if (pending.expectFinal && status === "accepted") {
+    if (pending.expectFinal && parsed.ok && status === "accepted") {
+      try {
+        pending.onAccepted?.(payload);
+      } catch {
+        // An observer failure must not drop the terminal response.
+      }
       return;
     }
 
@@ -777,6 +757,7 @@ class GatewayWsClient {
     const details = asRecord(errorRecord?.details);
     if (code) err.gatewayCode = code;
     if (details) err.gatewayDetails = details;
+    if (payload) err.gatewayPayload = payload;
     pending.reject(err);
   }
 }
@@ -816,8 +797,8 @@ async function autoApproveDevicePairing(params: {
 
     await client.connect(
       () => ({
-        minProtocol: PROTOCOL_VERSION,
-        maxProtocol: PROTOCOL_VERSION,
+        minProtocol: GATEWAY_PROTOCOL_VERSION,
+        maxProtocol: GATEWAY_PROTOCOL_VERSION,
         client: {
           id: params.clientId,
           version: params.clientVersion,
@@ -993,6 +974,101 @@ function extractResultText(value: unknown): string | null {
   return nonEmpty(record.text) ?? nonEmpty(record.summary) ?? null;
 }
 
+type AssistantTextAccumulator = {
+  apply: (data: Record<string, unknown>) => void;
+  text: () => string;
+};
+
+/**
+ * Rebuilds assistant text from v4 `agent` events with `stream: "assistant"`.
+ * Each event belongs to an assistant item (`data.itemId`); `data.delta` appends,
+ * `data.text` is an authoritative snapshot of the item that already includes
+ * the delta, and `data.replace` replaces the item text. Items are kept separate
+ * and joined in arrival order.
+ */
+export function createAssistantTextAccumulator(): AssistantTextAccumulator {
+  const order: string[] = [];
+  const items = new Map<string, string>();
+  return {
+    apply(data) {
+      const itemId = typeof data.itemId === "string" ? data.itemId : "";
+      if (!items.has(itemId)) {
+        order.push(itemId);
+        items.set(itemId, "");
+      }
+      if (typeof data.text === "string") {
+        items.set(itemId, data.text);
+        return;
+      }
+      const delta = typeof data.delta === "string" ? data.delta : "";
+      items.set(itemId, data.replace === true ? delta : `${items.get(itemId) ?? ""}${delta}`);
+    },
+    text() {
+      return order
+        .map((itemId) => (items.get(itemId) ?? "").trim())
+        .filter(Boolean)
+        .join("\n\n");
+    },
+  };
+}
+
+/**
+ * v4 assistant events repeat the whole item snapshot in `data.text` next to
+ * each `data.delta`. Logging the snapshot with every delta grows the run log
+ * quadratically and, past the log line cap, truncates the JSON so the
+ * transcript parser can no longer read the delta. Log the snapshot only when
+ * the event has no delta to carry (snapshots and replacements).
+ */
+export function projectAssistantEventForLog(data: Record<string, unknown>): Record<string, unknown> {
+  const hasDelta = typeof data.delta === "string" && data.delta.length > 0;
+  if (!hasDelta || data.replace === true) return data;
+  const { text: _snapshot, ...rest } = data;
+  return rest;
+}
+
+/**
+ * The gateway's terminal `agent` payload carries a status word in `summary`
+ * ("completed" / "failed" / "aborted"). Paperclip reads `resultJson.summary` as
+ * the run's reply text (and may post it to the issue), so keep the status word
+ * under `gatewaySummary` instead.
+ */
+function toRunResultJson(payload: unknown): Record<string, unknown> | null {
+  const record = asRecord(payload);
+  if (!record) return null;
+  const { summary, ...rest } = record;
+  return summary === undefined ? rest : { ...rest, gatewaySummary: summary };
+}
+
+const AGENT_WAIT_PENDING_POLL_MS = 1_000;
+
+/**
+ * Waits for a run through `agent.wait` until it reaches a terminal status or
+ * the wait budget runs out. `agent.wait` answers `pending` immediately while
+ * the run is queued behind another turn, so that status is polled.
+ */
+async function waitForAgentRun(
+  client: GatewayWsClient,
+  runId: string,
+  waitTimeoutMs: number,
+  requestSlackMs: number,
+): Promise<Record<string, unknown> | null> {
+  const deadline = Date.now() + waitTimeoutMs;
+  while (true) {
+    const remainingMs = Math.max(0, deadline - Date.now());
+    const waitPayload = await client.request<Record<string, unknown> | null>(
+      "agent.wait",
+      { runId, timeoutMs: remainingMs },
+      { timeoutMs: remainingMs + requestSlackMs },
+    );
+    const status = nonEmpty(waitPayload?.status)?.toLowerCase();
+    if (status !== "pending") return waitPayload;
+    if (Date.now() + AGENT_WAIT_PENDING_POLL_MS >= deadline) {
+      return { ...(waitPayload ?? {}), runId, status: "timeout" };
+    }
+    await new Promise((resolve) => setTimeout(resolve, AGENT_WAIT_PENDING_POLL_MS));
+  }
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const urlValue = asString(ctx.config.url, "").trim();
   if (!urlValue) {
@@ -1066,15 +1142,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
-  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
-
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
     message,
     sessionKey,
     idempotencyKey: ctx.runId,
   };
+  // `text` is folded into `message` above. `paperclip` is not part of the
+  // gateway's `agent` params schema, which rejects unknown properties
+  // (additionalProperties: false); the Paperclip context the agent needs is
+  // carried in the wake text.
   delete agentParams.text;
+  delete agentParams.paperclip;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
@@ -1082,7 +1161,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (typeof agentParams.timeout !== "number") {
-    agentParams.timeout = waitTimeoutMs;
+    // The gateway reads `agent.timeout` in seconds and ends the run itself
+    // (terminal status `timeout`) when it elapses.
+    agentParams.timeout = Math.ceil(waitTimeoutMs / 1000);
   }
 
   if (ctx.onMeta) {
@@ -1123,9 +1204,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   while (true) {
     const trackedRunIds = new Set<string>([ctx.runId]);
-    const assistantChunks: string[] = [];
+    const assistantText = createAssistantTextAccumulator();
     let lifecycleError: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
+    // Set from the `onAccepted` callback; held in an object so the later read
+    // is not narrowed to the initial null.
+    const accepted: { payload: Record<string, unknown> | null } = { payload: null };
 
     const onEvent = async (frame: GatewayEventFrame) => {
       if (frame.event !== "agent") {
@@ -1146,19 +1230,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const stream = nonEmpty(payload.stream) ?? "unknown";
       const data = asRecord(payload.data) ?? {};
+      const logData = stream === "assistant" ? projectAssistantEventForLog(data) : data;
       await ctx.onLog(
         "stdout",
-        `[openclaw-gateway:event] run=${runId} stream=${stream} data=${stringifyForLog(data, 8_000)}\n`,
+        `[openclaw-gateway:event] run=${runId} stream=${stream} data=${stringifyForLog(logData, 8_000)}\n`,
       );
 
       if (stream === "assistant") {
-        const delta = nonEmpty(data.delta);
-        const text = nonEmpty(data.text);
-        if (delta) {
-          assistantChunks.push(delta);
-        } else if (text) {
-          assistantChunks.push(text);
-        }
+        assistantText.apply(data);
         return;
       }
 
@@ -1195,11 +1274,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       await ctx.onLog("stdout", `[openclaw-gateway] connecting to ${parsedUrl.toString()}\n`);
 
-      const hello = await client.connect((nonce) => {
-        const signedAtMs = Date.now();
+      const hello = await client.connect((challenge) => {
         const connectParams: Record<string, unknown> = {
-          minProtocol: PROTOCOL_VERSION,
-          maxProtocol: PROTOCOL_VERSION,
+          minProtocol: GATEWAY_PROTOCOL_VERSION,
+          maxProtocol: GATEWAY_PROTOCOL_VERSION,
           client: {
             id: clientId,
             version: clientVersion,
@@ -1220,15 +1298,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
 
         if (deviceIdentity) {
+          // The gateway verifies the signature against the challenge it issued:
+          // `signedAt` is the challenge `ts`, and the signed token is the one it
+          // reads from `auth` (token, else deviceToken).
           const payload = buildDeviceAuthPayloadV3({
             deviceId: deviceIdentity.deviceId,
             clientId,
             clientMode,
             role,
             scopes,
-            signedAtMs,
-            token: authToken,
-            nonce,
+            signedAtMs: challenge.ts,
+            token: authToken ?? deviceToken,
+            nonce: challenge.nonce,
             platform: process.platform,
             deviceFamily,
           });
@@ -1236,8 +1317,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             id: deviceIdentity.deviceId,
             publicKey: deviceIdentity.publicKeyRawBase64Url,
             signature: signDevicePayload(deviceIdentity.privateKeyPem, payload),
-            signedAt: signedAtMs,
-            nonce,
+            signedAt: challenge.ts,
+            nonce: challenge.nonce,
           };
         }
         return connectParams;
@@ -1245,110 +1326,110 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       await ctx.onLog(
         "stdout",
-        `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
+        `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, GATEWAY_PROTOCOL_VERSION)}\n`,
       );
 
-      const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
-        timeoutMs: connectTimeoutMs,
-      });
+      // Protocol v4 `agent` is a two-phase request: an `accepted` ack, then a
+      // second `res` with the same id carrying the terminal outcome and the run
+      // result (payloads, meta, usage). The gateway enforces `agent.timeout`
+      // itself; the local deadline only backstops a lost terminal frame.
+      let terminalPayload: Record<string, unknown> | null;
+      try {
+        terminalPayload = await client.request<Record<string, unknown> | null>("agent", agentParams, {
+          timeoutMs: waitTimeoutMs + connectTimeoutMs,
+          expectFinal: true,
+          onAccepted: (payload) => {
+            accepted.payload = payload;
+            latestResultPayload = payload;
+            const acceptedRunId = nonEmpty(payload?.runId);
+            if (acceptedRunId) trackedRunIds.add(acceptedRunId);
+            void ctx.onLog(
+              "stdout",
+              `[openclaw-gateway] agent accepted runId=${acceptedRunId ?? ctx.runId} status=accepted\n`,
+            );
+          },
+        });
+      } catch (err) {
+        // A failed run still ends with a terminal frame for the accepted run
+        // (ok:false with a `{ runId, status, summary }` payload). Errors without
+        // one, such as a rejected request, are request failures.
+        const failedPayload = (err as GatewayResponseError | null)?.gatewayPayload ?? null;
+        if (!failedPayload || !nonEmpty(failedPayload.status)) throw err;
+        terminalPayload = failedPayload;
+      }
 
-      latestResultPayload = acceptedPayload;
+      latestResultPayload = terminalPayload;
+      const runId = nonEmpty(terminalPayload?.runId) ?? nonEmpty(accepted.payload?.runId) ?? ctx.runId;
+      trackedRunIds.add(runId);
+      let status = nonEmpty(terminalPayload?.status)?.toLowerCase() ?? "";
+      let failureMessage = nonEmpty(terminalPayload?.error) ?? nonEmpty(terminalPayload?.summary);
 
-      const acceptedStatus = nonEmpty(acceptedPayload?.status)?.toLowerCase() ?? "";
-      const acceptedRunId = nonEmpty(acceptedPayload?.runId) ?? ctx.runId;
-      trackedRunIds.add(acceptedRunId);
+      if (status === "in_flight") {
+        // The idempotency key matched a run that is still executing (for
+        // example a retried Paperclip run); its terminal frame belongs to the
+        // original request, so wait on the run instead.
+        await ctx.onLog("stdout", `[openclaw-gateway] run ${runId} already in flight; waiting via agent.wait\n`);
+        const waitPayload = await waitForAgentRun(client, runId, waitTimeoutMs, connectTimeoutMs);
+        latestResultPayload = waitPayload;
+        status = nonEmpty(waitPayload?.status)?.toLowerCase() ?? "";
+        failureMessage = nonEmpty(waitPayload?.error) ?? nonEmpty(waitPayload?.summary);
+      }
 
-      await ctx.onLog(
-        "stdout",
-        `[openclaw-gateway] agent accepted runId=${acceptedRunId} status=${acceptedStatus || "unknown"}\n`,
-      );
+      if (status === "timeout") {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: true,
+          errorMessage: failureMessage && failureMessage !== "aborted"
+            ? `OpenClaw gateway run timed out: ${failureMessage}`
+            : `OpenClaw gateway run timed out after ${waitTimeoutMs}ms`,
+          errorCode: "openclaw_gateway_wait_timeout",
+          resultJson: toRunResultJson(latestResultPayload),
+        };
+      }
 
-      if (acceptedStatus === "error") {
-        const errorMessage =
-          nonEmpty(acceptedPayload?.summary) ?? lifecycleError ?? "OpenClaw gateway agent request failed";
+      if (status === "error") {
+        // Rejected runs carry the rendered error in `summary`; runs that ended
+        // with a failed outcome carry the generic summary "failed" and the
+        // detail in the result meta or the lifecycle stream.
+        const resultError = nonEmpty(
+          asRecord(asRecord(asRecord(asRecord(latestResultPayload)?.result)?.meta)?.error)?.message,
+        );
+        const specificFailure = failureMessage && failureMessage !== "failed" ? failureMessage : null;
         return {
           exitCode: 1,
           signal: null,
           timedOut: false,
-          errorMessage,
+          errorMessage: specificFailure ?? resultError ?? lifecycleError ?? "OpenClaw gateway run failed",
           errorCode: "openclaw_gateway_agent_error",
-          resultJson: acceptedPayload,
+          resultJson: toRunResultJson(latestResultPayload),
         };
       }
 
-      if (acceptedStatus !== "ok") {
-        const waitPayload = await client.request<Record<string, unknown>>(
-          "agent.wait",
-          { runId: acceptedRunId, timeoutMs: waitTimeoutMs },
-          { timeoutMs: waitTimeoutMs + connectTimeoutMs },
-        );
-
-        latestResultPayload = waitPayload;
-
-        const waitStatus = nonEmpty(waitPayload?.status)?.toLowerCase() ?? "";
-        if (waitStatus === "timeout") {
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: true,
-            errorMessage: `OpenClaw gateway run timed out after ${waitTimeoutMs}ms`,
-            errorCode: "openclaw_gateway_wait_timeout",
-            resultJson: waitPayload,
-          };
-        }
-
-        if (waitStatus === "error") {
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
-            errorMessage:
-              nonEmpty(waitPayload?.error) ??
-              lifecycleError ??
-              "OpenClaw gateway run failed",
-            errorCode: "openclaw_gateway_wait_error",
-            resultJson: waitPayload,
-          };
-        }
-
-        if (waitStatus && waitStatus !== "ok") {
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
-            errorMessage: `Unexpected OpenClaw gateway agent.wait status: ${waitStatus}`,
-            errorCode: "openclaw_gateway_wait_status_unexpected",
-            resultJson: waitPayload,
-          };
-        }
+      if (status !== "ok") {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Unexpected OpenClaw gateway agent status: ${status || "missing"}`,
+          errorCode: "openclaw_gateway_wait_status_unexpected",
+          resultJson: toRunResultJson(latestResultPayload),
+        };
       }
 
-      const summaryFromEvents = assistantChunks.join("").trim();
-      const summaryFromPayload =
-        extractResultText(asRecord(acceptedPayload?.result)) ??
-        extractResultText(acceptedPayload) ??
-        extractResultText(asRecord(latestResultPayload)) ??
-        null;
-      const summary = summaryFromEvents || summaryFromPayload || null;
+      // The terminal payload's own `summary` is a status word ("completed"),
+      // not reply text; the reply is in `result.payloads`.
+      const terminalResult = asRecord(asRecord(latestResultPayload)?.result);
+      const summary = extractResultText(terminalResult) ?? (assistantText.text() || null);
 
-      const acceptedResult = asRecord(acceptedPayload?.result);
       const latestPayload = asRecord(latestResultPayload);
-      const latestResult = asRecord(latestPayload?.result);
-      const acceptedMeta = asRecord(acceptedResult?.meta) ?? asRecord(acceptedPayload?.meta);
-      const latestMeta = asRecord(latestResult?.meta) ?? asRecord(latestPayload?.meta);
-      const mergedMeta = {
-        ...(acceptedMeta ?? {}),
-        ...(latestMeta ?? {}),
-      };
-      const agentMeta =
-        asRecord(mergedMeta.agentMeta) ??
-        asRecord(acceptedMeta?.agentMeta) ??
-        asRecord(latestMeta?.agentMeta);
-      const usage = parseUsage(agentMeta?.usage ?? mergedMeta.usage);
-      const runtimeServices = extractRuntimeServicesFromMeta(agentMeta ?? mergedMeta);
-      const provider = nonEmpty(agentMeta?.provider) ?? nonEmpty(mergedMeta.provider) ?? "openclaw";
-      const model = nonEmpty(agentMeta?.model) ?? nonEmpty(mergedMeta.model) ?? null;
-      const costUsd = asNumber(agentMeta?.costUsd ?? mergedMeta.costUsd, 0);
+      const meta = asRecord(terminalResult?.meta) ?? asRecord(latestPayload?.meta) ?? {};
+      const agentMeta = asRecord(meta.agentMeta);
+      const usage = parseUsage(agentMeta?.usage ?? meta.usage);
+      const runtimeServices = extractRuntimeServicesFromMeta(agentMeta ?? meta);
+      const provider = nonEmpty(agentMeta?.provider) ?? nonEmpty(meta.provider) ?? "openclaw";
+      const model = nonEmpty(agentMeta?.model) ?? nonEmpty(meta.model) ?? null;
+      const costUsd = asNumber(agentMeta?.costUsd ?? meta.costUsd, 0);
 
       await ctx.onLog(
         "stdout",
@@ -1363,7 +1444,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(model ? { model } : {}),
         ...(usage ? { usage } : {}),
         ...(costUsd > 0 ? { costUsd } : {}),
-        resultJson: asRecord(latestResultPayload),
+        resultJson: toRunResultJson(latestPayload),
         ...(runtimeServices.length > 0 ? { runtimeServices } : {}),
         ...(summary ? { summary } : {}),
       };
